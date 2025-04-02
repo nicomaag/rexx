@@ -1,0 +1,7 @@
+{
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "minimist": "^1.2.8",
+    "puppeteer": "^24.4.0"
+  }
+}
