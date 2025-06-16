@@ -49,6 +49,20 @@ async function waitForSelectorWithRetry(pageOrFrame, selector, options = {}, ret
     }
 }
 
+// Helper: Retry page navigation
+async function gotoWithRetry(page, url, retries = 3, delayMs = 5000) {
+    for (let i = 0; i < retries; i++) {
+        try {
+            await page.goto(url, { waitUntil: "networkidle2", timeout: 60000 });
+            return;
+        } catch (err) {
+            if (i === retries - 1) throw err;
+            console.warn(`Retrying navigation to ${url} due to: ${err.message}`);
+            await delay(delayMs);
+        }
+    }
+}
+
 (async () => {
   try {
     const browser = await puppeteer.launch({
@@ -66,8 +80,8 @@ async function waitForSelectorWithRetry(pageOrFrame, selector, options = {}, ret
     });
     const page = await browser.newPage();
 
-    // Anmeldung
-    await page.goto("https://dirs21.rexx-systems.com/login.php", { waitUntil: "networkidle2", timeout: 60000 });
+    // Anmeldung mit robustem Retry für Navigation
+    await gotoWithRetry(page, "https://dirs21.rexx-systems.com/login.php", 3, 5000);
     await waitForSelectorWithRetry(page, "#loginform_username");
     await page.type("#loginform_username", BENUTZERNAME);
     await waitForSelectorWithRetry(page, "#password");
