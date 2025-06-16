@@ -30,47 +30,67 @@ async function retry(fn, retries = 2, delayMs = 1000) {
     }
 }
 
+// Check for required environment variables early
+if (!BENUTZERNAME || !PASSWORT) {
+    console.error('❌ BENUTZERNAME or PASSWORT is not set! Exiting.');
+    process.exit(1);
+}
+
+// Helper: Wait for selector with retries and longer timeout
+async function waitForSelectorWithRetry(pageOrFrame, selector, options = {}, retries = 4, delayMs = 3000) {
+    for (let i = 0; i < retries; i++) {
+        try {
+            return await pageOrFrame.waitForSelector(selector, { timeout: 25000, ...options });
+        } catch (err) {
+            if (i === retries - 1) throw err;
+            console.warn(`Retrying selector "${selector}" due to: ${err.message}`);
+            await delay(delayMs);
+        }
+    }
+}
+
 (async () => {
-  const browser = await puppeteer.launch({
-    headless: "new", // Use headless mode for server/CI
-    defaultViewport: null,
-    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH, // Use system Chromium in Docker
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--no-zygote',
-      '--single-process'
-    ]
-  });
-  const page = await browser.newPage();
+  try {
+    const browser = await puppeteer.launch({
+      headless: "new", // Use headless mode for server/CI
+      defaultViewport: null,
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH, // Use system Chromium in Docker
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--no-zygote',
+        '--single-process'
+      ]
+    });
+    const page = await browser.newPage();
 
     // Anmeldung
-    await page.goto("https://dirs21.rexx-systems.com/login.php", { waitUntil: "networkidle2" });
-    await page.waitForSelector("#loginform_username");
+    await page.goto("https://dirs21.rexx-systems.com/login.php", { waitUntil: "networkidle2", timeout: 60000 });
+    await waitForSelectorWithRetry(page, "#loginform_username");
     await page.type("#loginform_username", BENUTZERNAME);
-    await page.waitForSelector("#password");
+    await waitForSelectorWithRetry(page, "#password");
     await page.type("#password", PASSWORT);
-    await page.waitForSelector("#submit");
+    await waitForSelectorWithRetry(page, "#submit");
     await page.click("#submit");
 
     // Navigation im iframe#Start
-    await page.waitForSelector("iframe#Start");
+    await waitForSelectorWithRetry(page, "iframe#Start");
     const startFrameHandle = await page.$("iframe#Start");
     const startFrame = await startFrameHandle.contentFrame();
-    await startFrame.waitForSelector("#menu_666_item", { visible: true });
+    await waitForSelectorWithRetry(startFrame, "#menu_666_item", { visible: true });
     await startFrame.click("#menu_666_item");
     console.log('📁 "Mein Zeitmanagement" geklickt.');
 
     // Zugriff auf den Zielbereich: iframe#Unten
-    await page.waitForSelector("iframe#Unten");
+    await waitForSelectorWithRetry(page, "iframe#Unten");
     const untenFrameHandle = await page.$("iframe#Unten");
     const untenFrame = await untenFrameHandle.contentFrame();
 
     // Warten auf mindestens eine Zeile mit Saldo "-8:00"
-    const MAX_WAIT = 15000;
-    const INTERVAL = 500;
+    const MAX_WAIT = 30000;
+    const INTERVAL = 1000;
     let waited = 0;
     let found = false;
     while (waited < MAX_WAIT) {
@@ -118,7 +138,7 @@ async function retry(fn, retries = 2, delayMs = 1000) {
         // Warten, bis der DOM neu gerendert wurde (z. B. anhand eines bekannten Elements)
         await retry(
             async () => {
-                await untenFrame.waitForSelector("div#my_timemanagement_widget", { visible: true, timeout: 10000 });
+                await waitForSelectorWithRetry(untenFrame, "div#my_timemanagement_widget", { visible: true });
             },
             2,
             1000
@@ -142,6 +162,10 @@ async function retry(fn, retries = 2, delayMs = 1000) {
 
     console.log("✅ Alle Buchungen abgeschlossen.");
     await browser.close();
+  } catch (err) {
+    console.error("Fatal error:", err);
+    process.exit(1);
+  }
 })();
 
 // Gibt eine Zeile zurück, in der der Saldo genau dem gesuchten Text entspricht
