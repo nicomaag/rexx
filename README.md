@@ -29,13 +29,23 @@ docker pull nicomaa/rexx:latest
 
 ### 4. Automate with Cron (Linux Example)
 
-For timestamped log files, use the provided `run-container.sh` script. This will save each run's logs with the date and time in the filename:
+To automate the script and save logs for each run, use the provided `run-container.sh` script in your cron job. This script will pull the latest image, run the container with your `.env` file, and save logs with a timestamped filename in your chosen log directory.
+
+**Example crontab entry (runs every day at 20:00):**
 
 ```
 0 20 * * * /data/rexx/run-container.sh
 ```
 
-Edit `run-container.sh` to set your desired log directory (default: `/data/rexx/logs`).
+- Make sure `run-container.sh` is executable: `chmod +x /data/rexx/run-container.sh`
+- Edit `run-container.sh` to set the correct paths for your log directory and `.env` file if needed.
+- Logs will be saved in `/data/rexx/logs/` (or your configured directory) with a name like `rexx-YYYY-MM-DD_HH-MM-SS.log`.
+
+To edit your crontab, run:
+```
+crontab -e
+```
+Then add the line above.
 
 ---
 
