@@ -14,9 +14,9 @@ docker build -t rexx .
 Tag and push your image to Docker Hub or your preferred registry:
 
 ```
-docker tag rexx yourdockerhubusername/rexx:latest
+docker tag rexx nicomaa/rexx:latest
 
-docker push yourdockerhubusername/rexx:latest
+docker push nicomaa/rexx:latest
 ```
 
 ### 3. Pull and Run the Container on Your Server
@@ -24,23 +24,47 @@ docker push yourdockerhubusername/rexx:latest
 On your server, pull the image:
 
 ```
-docker pull yourdockerhubusername/rexx:latest
+docker pull nicomaa/rexx:latest
 ```
 
 ### 4. Automate with Cron (Linux Example)
 
-Add this line to your crontab (edit with `crontab -e`):
+For timestamped log files, use the provided `run-container.sh` script. This will save each run's logs with the date and time in the filename:
 
 ```
-0 20 * * * docker run --rm yourdockerhubusername/rexx:latest
+0 20 * * * /data/rexx/run-container.sh
 ```
 
-This will run the script every day at 20:00 (8pm). Adjust the time as needed.
+Edit `run-container.sh` to set your desired log directory (default: `/data/rexx/logs`).
 
-### Notes
-- The container is built and pushed from your local machine.
-- The server only needs Docker and access to your image registry.
-- The container is disposed after each run (`--rm`).
-- Update the image on the server by pushing a new version from your machine and running `docker pull` again.
+---
+
+## Logging & Notifications
+
+Each run will create a log file named like `rexx-bot-YYYY-MM-DD_HH-MM-SS.log` in your chosen log directory. Check these files to review the output or errors for any run.
+
+## Environment Variables
+
+Your script uses environment variables (e.g., `BENUTZERNAME`, `PASSWORT`).
+
+### Option 1: Pass Variables Directly
+
+```
+docker run --rm -e BENUTZERNAME=youruser -e PASSWORT=yourpass nicomaa/rexx:latest
+```
+
+### Option 2: Use a .env File
+
+1. Create a `.env` file with your variables:
+   ```
+   BENUTZERNAME=youruser
+   PASSWORT=yourpass
+   ```
+2. Run the container with:
+   ```
+   docker run --rm --env-file /data/rexx/.env nicomaa/rexx:latest
+   ```
+
+**Note:** Do not commit your `.env` file to version control. Add `.env` to your `.dockerignore` and `.gitignore`.
 
 ---

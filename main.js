@@ -31,8 +31,20 @@ async function retry(fn, retries = 2, delayMs = 1000) {
 }
 
 (async () => {
-    const browser = await puppeteer.launch({ headless: false, defaultViewport: null });
-    const page = await browser.newPage();
+  const browser = await puppeteer.launch({
+    headless: "new", // Use headless mode for server/CI
+    defaultViewport: null,
+    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH, // Use system Chromium in Docker
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--no-zygote',
+      '--single-process'
+    ]
+  });
+  const page = await browser.newPage();
 
     // Anmeldung
     await page.goto("https://dirs21.rexx-systems.com/login.php", { waitUntil: "networkidle2" });
