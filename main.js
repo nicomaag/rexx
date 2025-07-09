@@ -1,8 +1,9 @@
+// Node.js Puppeteer-Skript zur Buchungsautomatisierung mit verbessertem Frame-Handling und Fehler-Skipping
 const puppeteer = require("puppeteer");
 const minimist = require("minimist");
 require("dotenv").config();
 
-// Kommandozeilenparameter parsen (z. B. --kommen "08:30" --gehen "17:30")
+// Kommandozeilenparameter parsen
 const args = minimist(process.argv.slice(2));
 const KOMMEN_TIME = args.kommen || "09:00";
 const GEHEN_TIME = args.gehen || "18:00";
@@ -10,78 +11,75 @@ const GEHEN_TIME = args.gehen || "18:00";
 const BENUTZERNAME = process.env.BENUTZERNAME;
 const PASSWORT = process.env.PASSWORT;
 
-// Hilfsfunktion für Verzögerungen
+// Verzögerung
 function delay(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// Retry-Mechanismus für kritische Schritte
+// Retry-Mechanismus
 async function retry(fn, retries = 2, delayMs = 1000) {
-    for (let i = 0; i <= retries; i++) {
-        try {
-            return await fn();
-        } catch (error) {
-            if (i === retries) {
-                throw error;
-            }
-            console.warn(`Retry ${i + 1}/${retries} wegen Fehler: ${error.message}`);
-            await delay(delayMs);
-        }
+  for (let i = 0; i <= retries; i++) {
+    try {
+      return await fn();
+    } catch (error) {
+      if (i === retries) throw error;
+      console.warn(`Retry ${i + 1}/${retries} wegen Fehler: ${error.message}`);
+      await delay(delayMs);
     }
+  }
 }
 
-// Check for required environment variables early
+// Check Umgebungsvariablen
 if (!BENUTZERNAME || !PASSWORT) {
-    console.error('❌ BENUTZERNAME or PASSWORT is not set! Exiting.');
-    process.exit(1);
+  console.error('❌ BENUTZERNAME oder PASSWORT fehlt!');
+  process.exit(1);
 }
 
-// Helper: Wait for selector with retries and longer timeout
-async function waitForSelectorWithRetry(pageOrFrame, selector, options = {}, retries = 4, delayMs = 3000) {
-    for (let i = 0; i < retries; i++) {
-        try {
-            return await pageOrFrame.waitForSelector(selector, { timeout: 25000, ...options });
-        } catch (err) {
-            if (i === retries - 1) throw err;
-            console.warn(`Retrying selector "${selector}" due to: ${err.message}`);
-            await delay(delayMs);
-        }
+// Robustes WaitForSelector
+async function waitForSelectorWithRetry(ctx, selector, options = {}, retries = 4, delayMs = 3000) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await ctx.waitForSelector(selector, { timeout: 25000, ...options });
+    } catch (err) {
+      if (i === retries - 1) throw err;
+      console.warn(`Retry Selector "${selector}" wegen: ${err.message}`);
+      await delay(delayMs);
     }
+  }
 }
 
-// Helper: Retry page navigation
-async function gotoWithRetry(page, url, retries = 3, delayMs = 5000) {
-    for (let i = 0; i < retries; i++) {
-        try {
-            await page.goto(url, { waitUntil: "networkidle2", timeout: 60000 });
-            return;
-        } catch (err) {
-            if (i === retries - 1) throw err;
-            console.warn(`Retrying navigation to ${url} due to: ${err.message}`);
-            await delay(delayMs);
-        }
+// Navigation mit Retry (Network-Fehler speziell)
+async function gotoWithRetry(page, url, retries = 5, delayMs = 8000) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      await page.goto(url, { waitUntil: "networkidle2", timeout: 60000 });
+      return;
+    } catch (err) {
+      if (i === retries - 1) throw err;
+      if (/ERR_NETWORK_CHANGED/.test(err.message)) {
+        console.warn(`Netzwerk-Problem, warte ${delayMs * 2}ms vor Retry…`);
+        await delay(delayMs * 2);
+      } else {
+        console.warn(`Goto Retry ${i + 1}/${retries} wegen: ${err.message}`);
+        await delay(delayMs);
+      }
     }
+  }
 }
 
+// Hauptroutine
 (async () => {
   try {
     const browser = await puppeteer.launch({
-      headless: "new", // Use headless mode for server/CI
+      headless: "new",
       defaultViewport: null,
-      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH, // Use system Chromium in Docker
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--no-zygote',
-        '--single-process'
-      ]
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
+      args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu','--no-zygote','--single-process']
     });
     const page = await browser.newPage();
 
-    // Anmeldung mit robustem Retry für Navigation
-    await gotoWithRetry(page, "https://dirs21.rexx-systems.com/login.php", 3, 5000);
+    // Anmeldung
+    await gotoWithRetry(page, "https://dirs21.rexx-systems.com/login.php");
     await waitForSelectorWithRetry(page, "#loginform_username");
     await page.type("#loginform_username", BENUTZERNAME);
     await waitForSelectorWithRetry(page, "#password");
@@ -89,89 +87,74 @@ async function gotoWithRetry(page, url, retries = 3, delayMs = 5000) {
     await waitForSelectorWithRetry(page, "#submit");
     await page.click("#submit");
 
-    // Navigation im iframe#Start
+    // Navigation in "Mein Zeitmanagement"
     await waitForSelectorWithRetry(page, "iframe#Start");
     const startFrameHandle = await page.$("iframe#Start");
     const startFrame = await startFrameHandle.contentFrame();
     await waitForSelectorWithRetry(startFrame, "#menu_666_item", { visible: true });
-    await startFrame.click("#menu_666_item");
-    console.log('📁 "Mein Zeitmanagement" geklickt.');
+    // Klick löst Navigation aus, daher kombinieren
+    await Promise.all([
+      startFrame.click("#menu_666_item"),
+      page.waitForNavigation({ waitUntil: "networkidle2", timeout: 60000 }),
+    ]);
+    console.log('📁 "Mein Zeitmanagement" geöffnet.');
 
-    // Zugriff auf den Zielbereich: iframe#Unten
-    await waitForSelectorWithRetry(page, "iframe#Unten");
-    const untenFrameHandle = await page.$("iframe#Unten");
-    const untenFrame = await untenFrameHandle.contentFrame();
-
-    // Warten auf mindestens eine Zeile mit Saldo "-8:00"
-    const MAX_WAIT = 30000;
-    const INTERVAL = 1000;
-    let waited = 0;
-    let found = false;
-    while (waited < MAX_WAIT) {
-        await delay(INTERVAL);
-        waited += INTERVAL;
-        const row = await getRowWithSaldo(untenFrame, "-8:00");
-        if (row) {
-            found = true;
-            break;
-        }
-    }
-    if (!found) {
-        console.error("❌ Keine -8:00-Zeilen nach Timeout gefunden.");
-        await browser.close();
-        return;
-    }
-    console.log("✅ Mindestens eine Zeile mit Saldo -8:00 gefunden.");
-
-    // Wiederhole den Buchungsvorgang, solange Zeilen mit -8:00 vorhanden sind
+    // Booking-Loop mit Skip-Logik
+    const failCounts = {};
     while (true) {
-        const row = await getRowWithSaldo(untenFrame, "-8:00");
-        if (!row) {
-            console.log("Keine weiteren Zeilen mit Saldo -8:00 gefunden.");
-            break;
-        }
-        // Eindeutigen Identifier aus der Zeile extrahieren (angenommen, die Klasse hat das Format "grid_row_pr_YYYY-MM-DD")
-        const dateIdentifier = await row.evaluate((r) => {
-            const classList = r.className.split(" ");
-            const match = classList.find((c) => c.startsWith("grid_row_pr_"));
-            return match ? match.replace("grid_row_pr_", "") : null;
-        });
-        if (!dateIdentifier) {
-            console.warn("Kein eindeutiger Identifier in der Zeile gefunden, überspringe.");
-            break;
-        }
+      // Frame immer neu holen
+      await waitForSelectorWithRetry(page, "iframe#Unten");
+      const untenFrameHandle = await page.$("iframe#Unten");
+      const untenFrame = await untenFrameHandle.contentFrame();
 
-        // 1. "Kommen" buchen
-        try {
-            await processBooking(row, untenFrame, dateIdentifier, KOMMEN_TIME, "Kommen");
-        } catch (error) {
-            console.error(`Fehler bei "Kommen"-Buchung für ${dateIdentifier}: ${error.message}`);
-            continue;
-        }
+      // Zeile mit -8:00 suchen
+      const row = await getRowWithSaldo(untenFrame, "-8:00");
+      if (!row) { console.log("Keine weiteren -8:00-Zeilen."); break; }
 
-        // Warten, bis der DOM neu gerendert wurde (z. B. anhand eines bekannten Elements)
-        await retry(
-            async () => {
-                await waitForSelectorWithRetry(untenFrame, "div#my_timemanagement_widget", { visible: true });
-            },
-            2,
-            1000
-        ).catch(() => {});
+      // Datum extrahieren
+      const dateIdentifier = await row.evaluate(r => {
+        const cls = r.className.split(" ").find(c=>c.startsWith("grid_row_pr_"));
+        return cls?.replace("grid_row_pr_", "");
+      });
+      if (!dateIdentifier) break;
 
-        // 2. "Gehen" buchen: Hole die aktualisierte Zeile neu anhand des Identifiers
-        const updatedRow = await untenFrame.$(`tr.grid_row_pr_${dateIdentifier}`);
-        if (!updatedRow) {
-            console.error(`⚠️ Aktualisierte Zeile ${dateIdentifier} nicht gefunden – überspringe "Gehen"-Buchung.`);
-            continue;
-        }
-        try {
-            await processBooking(updatedRow, untenFrame, dateIdentifier, GEHEN_TIME, "Gehen");
-        } catch (error) {
-            console.error(`Fehler bei "Gehen"-Buchung für ${dateIdentifier}: ${error.message}`);
-            continue;
-        }
-        // Optionale Wartezeit zwischen den Einträgen (z. B. 5 Sekunden)
-        await delay(5000);
+      // Skip nach 2 Fehlversuchen
+      if ((failCounts[dateIdentifier] || 0) >= 2) {
+        console.warn(`Überspringe ${dateIdentifier} nach ${failCounts[dateIdentifier]} Fehlversuchen.`);
+        await row.evaluate(r=>r.style.display="none");
+        continue;
+      }
+
+      // 1) Kommen buchen
+      try {
+        await processBooking(row, untenFrame, dateIdentifier, KOMMEN_TIME, "Kommen");
+      } catch (err) {
+        failCounts[dateIdentifier] = (failCounts[dateIdentifier] || 0) + 1;
+        console.error(`Fehler bei 'Kommen' ${dateIdentifier}: ${err.message}`);
+        continue;
+      }
+
+      // Kurz warten auf Neuladen
+      await retry(() => waitForSelectorWithRetry(untenFrame, "div#my_timemanagement_widget", { visible: true }), 2, 1000).catch(()=>{});
+
+      // 2) Gehen buchen
+      const updatedRow = await untenFrame.$(`tr.grid_row_pr_${dateIdentifier}`);
+      if (!updatedRow) {
+        console.error(`Zeile ${dateIdentifier} nicht gefunden, überspringe 'Gehen'.`);
+        failCounts[dateIdentifier] = (failCounts[dateIdentifier] || 0) + 1;
+        continue;
+      }
+      try {
+        await processBooking(updatedRow, untenFrame, dateIdentifier, GEHEN_TIME, "Gehen");
+      } catch (err) {
+        failCounts[dateIdentifier] = (failCounts[dateIdentifier] || 0) + 1;
+        console.error(`Fehler bei 'Gehen' ${dateIdentifier}: ${err.message}`);
+        continue;
+      }
+
+      // Erfolgreich → Fehlzähler resetten und Pause
+      delete failCounts[dateIdentifier];
+      await delay(5000);
     }
 
     console.log("✅ Alle Buchungen abgeschlossen.");
@@ -182,87 +165,58 @@ async function gotoWithRetry(page, url, retries = 3, delayMs = 5000) {
   }
 })();
 
-// Gibt eine Zeile zurück, in der der Saldo genau dem gesuchten Text entspricht
+// Hilfsfunktionen
 async function getRowWithSaldo(frame, saldoText) {
-    const allRows = await frame.$$("tr.grid_row");
-    for (const row of allRows) {
-        const saldoCell = await row.$("td:nth-child(5) div");
-        const text = saldoCell && (await frame.evaluate((el) => el.textContent.trim(), saldoCell));
-        if (text === saldoText) {
-            return row;
-        }
-    }
-    return null;
+  const rows = await frame.$$("tr.grid_row");
+  for (const r of rows) {
+    const cell = await r.$("td:nth-child(5) div");
+    const txt = cell && await frame.evaluate(el=>el.textContent.trim(), cell);
+    if (txt === saldoText) return r;
+  }
+  return null;
 }
 
-// Verarbeitet eine Buchung (öffnet Formular, füllt Uhrzeit und klickt "Beantragen")
-async function processBooking(row, frame, dateIdentifier, timeValue, label) {
-    const buchenLink = await row.$('a[aria-label="Zeitbuchung erfassen"]');
-    if (!buchenLink) {
-        throw new Error("Kein Buchungsbutton in der Zeile gefunden.");
-    }
-    await frame.evaluate((el) => el.scrollIntoView({ behavior: "smooth", block: "center" }), buchenLink);
-    await frame.evaluate((el) => el.click(), buchenLink);
-    await delay(500);
+async function processBooking(row, frame, dateId, timeValue, label) {
+  const buchenLink = await row.$('a[aria-label="Zeitbuchung erfassen"]');
+  if (!buchenLink) throw new Error("Kein Buchungsbutton gefunden");
+  await frame.evaluate(el=>el.scrollIntoView({behavior:"smooth",block:"center"}), buchenLink);
+  await frame.evaluate(el=>el.click(), buchenLink);
+  await delay(500);
 
-    const formFrame = await retry(() => openBookingForm(frame), 2, 1000);
-    if (!formFrame) {
-        throw new Error("Buchungsformular konnte nicht geladen werden.");
-    }
-    console.log(`🟢 Buche '${label}' um ${timeValue} ...`);
-    await bucheZeit(formFrame, timeValue);
-    await waitForFormClosure(frame);
+  const formFrame = await retry(()=>openBookingForm(frame), 2, 1000);
+  if (!formFrame) throw new Error("Formular nicht geladen");
+  console.log(`🟢 Buche '${label}' um ${timeValue}`);
+  await bucheZeit(formFrame, timeValue);
+  await waitForFormClosure(frame);
 }
 
-// Öffnet das Buchungsformular und gibt das zugehörige Content-Frame zurück
 async function openBookingForm(frame) {
-    const formFrameHandle = await frame
-        .waitForSelector("iframe#time_workflow_form_layer_iframe", { visible: true, timeout: 10000 })
-        .catch(() => null);
-    if (!formFrameHandle) {
-        return null;
-    }
-    return await formFrameHandle.contentFrame();
+  const fh = await frame.waitForSelector("iframe#time_workflow_form_layer_iframe", { visible:true, timeout:10000 }).catch(()=>null);
+  return fh ? await fh.contentFrame() : null;
 }
 
-// Wartet darauf, dass das Buchungsformular geschlossen wird
 async function waitForFormClosure(frame) {
-    await frame
-        .waitForSelector("iframe#time_workflow_form_layer_iframe", { hidden: true, timeout: 15000 })
-        .catch(() => console.warn("⚠️ Buchungsformular schließt nicht innerhalb des Zeitlimits."));
+  try {
+    await frame.waitForSelector("iframe#time_workflow_form_layer_iframe", { hidden:true, timeout:30000 });
+  } catch {
+    console.warn("⚠️ Formular schließt nicht, warte auf Button-Verschwinden");
+    await frame.waitForSelector("a#application_creation_toolbar_save", { hidden:true, timeout:10000 }).catch(()=>{});
+  }
 }
 
-// Füllt im Buchungsformular das Uhrzeitfeld aus und klickt auf "Beantragen"
 async function bucheZeit(frame, zeit) {
-    await delay(1000);
-    let input = null;
-    const zeitRow = await frame.$("#row_ZEIT");
-    if (zeitRow) {
-        input = await zeitRow.$("input.stdformelem_time");
-    }
-    if (!input) {
-        input = await frame.$("#form_1173");
-    }
-    if (input) {
-        await input.click({ clickCount: 3 });
-        await input.type(zeit);
-    } else {
-        throw new Error("Kein Eingabefeld für Uhrzeit gefunden!");
-    }
+  await delay(1000);
+  let input = await frame.$("#row_ZEIT input.stdformelem_time") || await frame.$("#form_1173");
+  if (!input) throw new Error("Zeitfeld nicht gefunden");
+  await input.click({clickCount:3}); await input.type(zeit);
 
-    let button = await frame.$("a#application_creation_toolbar_save");
-    if (!button) {
-        const btns = await frame.$x("//a[contains(text(), 'Beantragen')]");
-        if (btns.length > 0) {
-            button = btns[0];
-        }
-    }
-    if (button) {
-        await delay(1000);
-        await frame.evaluate((el) => el.scrollIntoView(), button);
-        await frame.evaluate((el) => el.click(), button);
-    } else {
-        throw new Error("Kein 'Beantragen'-Button gefunden!");
-    }
-    await delay(5000);
+  let btn = await frame.$("a#application_creation_toolbar_save");
+  if (!btn) {
+    const arr = await frame.$x("//a[contains(text(),'Beantragen')]");
+    btn = arr[0];
+  }
+  if (!btn) throw new Error("Beantragen-Button fehlt");
+  await frame.evaluate(el=>el.scrollIntoView(), btn);
+  await frame.evaluate(el=>el.click(), btn);
+  await delay(5000);
 }
