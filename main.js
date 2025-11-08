@@ -25,7 +25,7 @@ const DEFAULT_MODE = (args.mode || "Office").trim(); // Fallback, falls ENV nich
 
 // Debug: mit --debug wird headless sichtbar und jede Aktion verlangsamt
 const DEBUG = !!args.debug;
-const SLOWMO = DEBUG ? parseInt(args.slowmo, 10) || 250 : 0;
+const SLOWMO = DEBUG ? parseInt(args.slowmo, 10) || 50 : 0;
 
 // === ENV-Creds (UNVERÄNDERT) ===
 const BENUTZERNAME = process.env.BENUTZERNAME;
@@ -269,8 +269,8 @@ function getModeForDate(dateId) {
 (async () => {
 	try {
 		const browser = await puppeteer.launch({
-			headless: false, // sichtbar lassen (wie original)
-			slowMo: SLOWMO, // im Debug z.B. 250ms pro Aktion
+			headless: !DEBUG,
+			slowMo: SLOWMO, // im Debug z.B. 50ms pro Aktion
 			defaultViewport: null,
 			dumpio: true,
 			args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
