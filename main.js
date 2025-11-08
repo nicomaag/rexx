@@ -1,8 +1,8 @@
 // Node.js Puppeteer-Skript zur Buchungsautomatisierung (LOGIN & NAVIGATION UNVERÄNDERT)
 // Bucht JEDE Zeile mit Saldo -8:00 direkt in der Buchungsliste – PRO TAG NUR EIN MAL:
 //   - öffnet Formular aus der jeweiligen Tabellenzeile
-//   - setzt Start- (Kommen) und Endzeit (Gehen)
-//   - wählt Projekt (Remote/Office) über den globalen Dialog (jetzt: pro Wochentag aus ENV)
+//   - setzt Start- (Kommen) und Endzeit (Gehen) mit stabilen Waits/Retry
+//   - öffnet robust den globalen Projekt-Dialog (idempotent) & wählt Remote/Office (pro Wochentag aus ENV)
 //   - speichert
 // Debug: --debug [--slowmo=250]; Zeiten: --kommen=09:00 --gehen=18:00
 //
@@ -23,9 +23,13 @@ const KOMMEN_TIME = args.kommen || "09:00";
 const GEHEN_TIME = args.gehen || "18:00";
 const DEFAULT_MODE = (args.mode || "Office").trim(); // Fallback, falls ENV nichts vorgibt
 
-// Debug: mit --debug wird headless sichtbar und jede Aktion verlangsamt
+// Debug-Schalter
 const DEBUG = !!args.debug;
 const SLOWMO = DEBUG ? parseInt(args.slowmo, 10) || 50 : 0;
+
+// Zusätzliche Miniverzögerungen für UI-Animationen
+const NODE_ANIM_DELAY = parseInt(args.animdelay || process.env.NODE_ANIM_DELAY_MS || 180, 10);
+const POST_SELECT_DELAY = 250;
 
 // === ENV-Creds (UNVERÄNDERT) ===
 const BENUTZERNAME = process.env.BENUTZERNAME;
@@ -39,25 +43,23 @@ if (!BENUTZERNAME || !PASSWORT) {
 // === Helpers ===
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function retry(fn, retries = 2, delayMs = 1000) {
-	for (let i = 0; i <= retries; i++) {
-		try {
-			return await fn();
-		} catch (err) {
-			if (i === retries) throw err;
-			console.warn(`Retry ${i + 1}/${retries} wegen Fehler: ${err.message}`);
+async function retry(fn, retries = 3, delayMs = 600, tag = "op") {
+	let lastErr;
+	for (let i = 0; i < retries; i++) {
+		try { return await fn(i); }
+		catch (err) {
+			lastErr = err;
+			console.warn(`↻ Retry ${i + 1}/${retries} (${tag}): ${err.message}`);
 			await delay(delayMs);
 		}
 	}
+	throw lastErr;
 }
 
 async function waitForSelectorWithRetry(ctx, selector, options = {}, retries = 4, delayMs = 3000) {
 	for (let i = 0; i < retries; i++) {
 		try {
-			return await ctx.waitForSelector(selector, {
-				timeout: 25000,
-				...options,
-			});
+			return await ctx.waitForSelector(selector, { timeout: 25000, ...options });
 		} catch (err) {
 			if (i === retries - 1) throw err;
 			console.warn(`Retry Selector "${selector}" wegen: ${err.message}`);
@@ -157,18 +159,12 @@ async function robustClick(frame, handle) {
 	const ok = await frame.evaluate((el) => {
 		if (!el || el.nodeType !== 1) return false;
 		try {
-			el.scrollIntoView({
-				behavior: "instant",
-				block: "center",
-				inline: "center",
-			});
+			el.scrollIntoView({ behavior: "instant", block: "center", inline: "center" });
 			el.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
 			el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
 			el.click();
 			return true;
-		} catch {
-			return false;
-		}
+		} catch { return false; }
 	}, handle);
 	if (ok) return;
 	await handle.click().catch(() => { });
@@ -178,28 +174,18 @@ async function robustClick(frame, handle) {
    Wochentags-Logik aus ENV
    =========================== */
 
-// Normalisiert Wochentags-Tokens in Kurzform EN: Mon..Sun
 function normalizeWeekToken(tokRaw) {
 	if (!tokRaw) return null;
 	const t = String(tokRaw).trim().toLowerCase();
 	const map = {
-		mon: "Mon",
-		mo: "Mon",
-		tue: "Tue",
-		di: "Tue",
-		wed: "Wed",
-		mi: "Wed",
-		thu: "Thu",
-		don: "Thu",
-		do: "Thu",
-		fri: "Fri",
-		fr: "Fri",
-		sat: "Sat",
-		sa: "Sat",
-		sun: "Sun",
-		so: "Sun",
+		mon: "Mon", mo: "Mon",
+		tue: "Tue", di: "Tue",
+		wed: "Wed", mi: "Wed",
+		thu: "Thu", don: "Thu", do: "Thu",
+		fri: "Fri", fr: "Fri",
+		sat: "Sat", sa: "Sat",
+		sun: "Sun", so: "Sun",
 	};
-	// also accept full english
 	if (t.startsWith("mon")) return "Mon";
 	if (t.startsWith("tue")) return "Tue";
 	if (t.startsWith("wed")) return "Wed";
@@ -210,17 +196,10 @@ function normalizeWeekToken(tokRaw) {
 	return map[t] || null;
 }
 
-// Parsed Config: returns a map { Mon:"Remote"| "Office", ... }
 function buildWeekdayModeMapFromEnv() {
 	const map = {};
-	const parseMode = (v) =>
-		String(v || "")
-			.toLowerCase()
-			.startsWith("off")
-			? "Office"
-			: "Remote";
+	const parseMode = (v) => (String(v || "").toLowerCase().startsWith("off") ? "Office" : "Remote");
 
-	// 1) WEEKDAY_MODE
 	const str = process.env.WEEKDAY_MODE;
 	if (str) {
 		for (const part of str.split(",")) {
@@ -232,7 +211,6 @@ function buildWeekdayModeMapFromEnv() {
 		}
 	}
 
-	// 2) REMOTE_DAYS / OFFICE_DAYS
 	const addDays = (list, mode) => {
 		if (!list) return;
 		for (const tok of list.split(",")) {
@@ -246,10 +224,8 @@ function buildWeekdayModeMapFromEnv() {
 	return map;
 }
 
-// dateId: "YYYY-MM-DD" -> weekday "Mon".."Sun" without TZ drift
 function weekdayFromDateId(dateId) {
 	const [y, m, d] = dateId.split("-").map((n) => parseInt(n, 10));
-	// Use UTC to avoid local TZ offset shifting the day
 	const dt = new Date(Date.UTC(y, m - 1, d));
 	const idx = dt.getUTCDay(); // 0=Sun..6=Sat
 	return ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][idx];
@@ -265,12 +241,29 @@ function getModeForDate(dateId) {
 	return mode;
 }
 
+/* ===========================
+   Watchdog (pro Tag)
+   =========================== */
+
+async function withWatchdog(promiseFactory, ms, label) {
+	let timeout;
+	const timeoutPromise = new Promise((_, rej) => {
+		timeout = setTimeout(() => rej(new Error(`Watchdog timeout (${label}) after ${ms}ms`)), ms);
+	});
+	try {
+		const res = await Promise.race([promiseFactory(), timeoutPromise]);
+		return res;
+	} finally {
+		clearTimeout(timeout);
+	}
+}
+
 // === MAIN ===
 (async () => {
 	try {
 		const browser = await puppeteer.launch({
-			headless: !DEBUG,
-			slowMo: SLOWMO, // im Debug z.B. 50ms pro Aktion
+			headless: false,
+			slowMo: 0,
 			defaultViewport: null,
 			dumpio: true,
 			args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
@@ -294,9 +287,7 @@ function getModeForDate(dateId) {
 		await waitForSelectorWithRetry(page, "iframe#Start");
 		const startFrameHandle = await page.$("iframe#Start");
 		const startFrame = await startFrameHandle.contentFrame();
-		await waitForSelectorWithRetry(startFrame, "#menu_666_item", {
-			visible: true,
-		});
+		await waitForSelectorWithRetry(startFrame, "#menu_666_item", { visible: true });
 		await Promise.all([
 			startFrame.click("#menu_666_item"),
 			page.waitForNavigation({ waitUntil: "networkidle2", timeout: 60000 }),
@@ -326,7 +317,11 @@ function getModeForDate(dateId) {
 			const modeForThisDay = getModeForDate(dateId); // "Remote" | "Office"
 
 			try {
-				await processDayBooking(untenFrame, page, dateId, modeForThisDay);
+				await withWatchdog(
+					() => processDayBooking(untenFrame, page, dateId, modeForThisDay),
+					DEBUG ? 180000 : 90000,
+					`processDayBooking(${dateId})`
+				);
 			} catch (err) {
 				console.error(`❌ Fehler beim Buchen für ${dateId}: ${err.message}`);
 			}
@@ -364,9 +359,9 @@ async function getAllDatesWithSaldo(frame, saldoText) {
 /**
  * PRO TAG EINMAL BUCHEN:
  * - klickt den Zeilen-Link "Zeitbuchung erfassen"
- * - setzt Start/Ende im Formular
- * - wählt Projekt (Remote/Office) über globalen Dialog (per Wochentag)
- * - speichert das Formular
+ * - wartet stabil, setzt Start/Ende (mit Retry)
+ * - öffnet robust den globalen Projekt-Dialog (idempotent) & wählt Modus
+ * - speichert das Formular (blockierend, bis Layer geschlossen)
  */
 async function processDayBooking(untenFrame, page, dateId, modeForDay /*Remote|Office*/) {
 	const row = await untenFrame.$(`tr.grid_row.grid_row_pr_${cssEscape(dateId)}`);
@@ -387,21 +382,33 @@ async function processDayBooking(untenFrame, page, dateId, modeForDay /*Remote|O
 	}, row);
 	if (!clicked) throw new Error("Kein Buchungsbutton in der Zeile gefunden");
 
-	await delay(200);
+	await delay(150);
 
 	// Formular-iFrame im Widget
-	const formFrame = await openBookingForm(untenFrame);
+	let formFrame = await openBookingForm(untenFrame);
 	if (!formFrame) throw new Error("Formular nicht geladen");
 
-	// Start- und Endzeit setzen
-	await setTimeInForm(formFrame);
+	// Start- und Endzeit mit Retry setzen (Form re-render tolerant)
+	await retry(async (attempt) => {
+		if (attempt > 0) {
+			formFrame = await openBookingForm(untenFrame);
+			if (!formFrame) throw new Error("Formular nicht geladen (nach Re-Render)");
+		}
+		await waitForTimeInputsStable(formFrame);
+		await setTimeInForm(formFrame);
+	}, 4, 400, "setTimeInForm");
 
-	// Projekt wählen (Remote/Office) über globalen Dialog
-	const projectClickable = await findProjectClickable(formFrame);
-	if (!projectClickable) throw new Error("Projektfeld im Formular nicht gefunden");
-	await formFrame.evaluate((el) => el.scrollIntoView({ behavior: "instant", block: "center" }), projectClickable);
-	await robustClick(formFrame, projectClickable);
-	await handleProjektAuswahlDialogOnPage(page, modeForDay);
+	// Projekt wählen (Remote/Office) – idempotent & robust
+	await retry(async (attempt) => {
+		if (attempt > 0) {
+			await ensureProjektLayerClosed(page);
+			formFrame = await openBookingForm(untenFrame);
+			if (!formFrame) throw new Error("Formular nicht geladen (vor Projektwahl)");
+		}
+		await ensureProjektLayerClosed(page);
+		await openProjektDialogWithStrategies(formFrame, page);      // öffnet zuverlässig den Layer oder re-used offenen
+		await handleProjektAuswahlDialogOnPage(page, modeForDay);    // wählt Eintrag & „Übernehmen“ (wartet bis Layer wieder zu)
+	}, 4, 700, "openSelectProject");
 
 	// Speichern & schließen
 	if (!DEBUG) {
@@ -414,157 +421,449 @@ async function processDayBooking(untenFrame, page, dateId, modeForDay /*Remote|O
 
 async function openBookingForm(frame) {
 	const fh = await frame
-		.waitForSelector("iframe#time_workflow_form_layer_iframe", {
-			visible: true,
-			timeout: 15000,
-		})
+		.waitForSelector("iframe#time_workflow_form_layer_iframe", { visible: true, timeout: 15000 })
 		.catch(() => null);
 	return fh ? await fh.contentFrame() : null;
 }
 
 /**
- * Setzt beide Zeitfelder:
- *  - Start: KOMMEN_TIME
- *  - Ende : GEHEN_TIME
- * Nutzt Attribut-Selektoren, weil die IDs mit Ziffer beginnen.
+ * Wartet bis die Zeitsektion stabil ist (mind. 2 Zeit-Inputs vorhanden).
+ */
+async function waitForTimeInputsStable(formFrame) {
+	await formFrame.waitForFunction(() => {
+		const box = document.querySelector('#row_ZEIT');
+		if (!box) return false;
+		const inputs = box.querySelectorAll('input.stdformelem_time');
+		return inputs && inputs.length >= 2;
+	}, { timeout: 8000 });
+}
+
+/**
+ * Setzt beide Zeitfelder (Start/Ende) und feuert die benötigten Events.
  */
 async function setTimeInForm(formFrame) {
-	await delay(100);
+	const fromCandidates = ['[id="1173_from"]', '[name="1173[from]"]', '#row_ZEIT input.stdformelem_time:first-of-type'];
+	const toCandidates = ['[id="1173_to"]', '[name="1173[to]"]', '#row_ZEIT input.stdformelem_time:nth-of-type(2)'];
 
-	const fromCandidates = ['[id="1173_from"]', '[name="1173[from]"]', "#row_ZEIT input.stdformelem_time:first-of-type"];
-	const toCandidates = ['[id="1173_to"]', '[name="1173[to]"]', "#row_ZEIT input.stdformelem_time:nth-of-type(2)"];
+	await delay(50);
 
 	let fromInput = null;
 	for (const sel of fromCandidates) {
 		console.log(`🔭 Versuche fromInput mit Selektor: ${sel}`);
 		fromInput = await formFrame.$(sel);
-		if (fromInput) {
-			console.log(`🎯 fromInput gefunden mit Selektor: ${sel}`);
-			break;
-		}
+		if (fromInput) { console.log(`🎯 fromInput gefunden mit Selektor: ${sel}`); break; }
 	}
 	let toInput = null;
 	for (const sel of toCandidates) {
 		console.log(`🔭 Versuche toInput mit Selektor: ${sel}`);
 		toInput = await formFrame.$(sel);
-		if (toInput) {
-			console.log(`🎯 toInput gefunden mit Selektor: ${sel}`);
-			break;
+		if (toInput) { console.log(`🎯 toInput gefunden mit Selektor: ${sel}`); break; }
+	}
+
+	if (!fromInput || !toInput) {
+		const both = await formFrame.$$('#row_ZEIT input.stdformelem_time');
+		if (both.length >= 2) {
+			fromInput = fromInput || both[0];
+			toInput = toInput || both[1];
+			console.log("🛟 Fallback: #row_ZEIT input.stdformelem_time [0] & [1] verwendet");
 		}
 	}
 
 	const fill = async (handle, value) => {
-		await formFrame.evaluate((el) => {
+		await formFrame.evaluate((el, v) => {
 			el.focus();
-			try {
-				el.select?.();
-			} catch { }
+			try { el.select?.(); } catch { }
 			el.value = "";
-		}, handle);
-		await handle.type(value);
-		await formFrame.evaluate((el) => {
+			el.value = v;
 			el.dispatchEvent(new Event("input", { bubbles: true }));
 			el.dispatchEvent(new Event("change", { bubbles: true }));
 			el.blur();
-		}, handle);
+		}, handle, value);
 	};
 
 	if (fromInput && toInput) {
 		await fill(fromInput, KOMMEN_TIME);
-		await delay(60);
+		await delay(80);
 		await fill(toInput, GEHEN_TIME);
 		return;
 	}
 
-	// Falls UIs abweichen, hier ggf. erweitern:
 	if (!fromInput && !toInput) throw new Error("Zeit-Eingabefelder im Formular nicht gefunden");
 	if (!fromInput) throw new Error("Start-Eingabefeld im Formular nicht gefunden");
 	if (!toInput) throw new Error("End-Eingabefeld im Formular nicht gefunden");
 }
 
-async function findProjectClickable(formFrame) {
-	const selectors = [
+/* ===========================
+   Projekt-Dialog: Robust & Idempotent
+   =========================== */
+
+async function ensureProjektLayerClosed(page) {
+	const open = await page.$('#time_pze_selection_layer');
+	if (open) {
+		const visible = await page.evaluate(el => {
+			const s = window.getComputedStyle(el);
+			return s && s.display !== 'none' && s.visibility !== 'hidden';
+		}, open).catch(() => false);
+		if (visible) {
+			const btn = await $x(page, "//a[contains(normalize-space(),'Abbrechen') or contains(normalize-space(),'Schließen')]");
+			if (btn[0]) await btn[0].click().catch(() => { });
+			await page.keyboard.press('Escape').catch(() => { });
+			await page.waitForSelector('#time_pze_selection_layer', { hidden: true, timeout: 3000 }).catch(() => { });
+		}
+	}
+}
+
+/**
+ * Öffnet den Projekt-Layer, falls nicht bereits offen (idempotent).
+ */
+async function openProjektDialogWithStrategies(formFrame, page) {
+	// Bereits offen?
+	const already = await page.$('#time_pze_selection_layer');
+	if (already) {
+		const visible = await page.evaluate(el => {
+			const s = window.getComputedStyle(el);
+			return s && s.display !== 'none' && s.visibility !== 'hidden';
+		}, already).catch(() => false);
+		if (visible) return; // Layer schon offen
+	}
+
+	const candidateSelectors = [
 		'a[aria-label*="Projekt"]',
 		'button[aria-label*="Projekt"]',
 		'a[title*="Projekt"]',
 		'button[title*="Projekt"]',
 		'a[href*="project"]',
-		"button:has(span)",
-		"a:has(span)",
+		'button:has(span)',
+		'a:has(span)',
+		'#row_ZEIT ~ * a[aria-label*="Projekt"]',
+		'#row_ZEIT ~ * button[aria-label*="Projekt"]',
 	];
-	for (const sel of selectors) {
+
+	// 1) Klassische Buttons
+	for (const sel of candidateSelectors) {
 		const h = await formFrame.$(sel).catch(() => null);
 		if (!h) continue;
-		const txt = await formFrame.evaluate((el) => el.textContent?.trim() || "", h).catch(() => "");
-		if (/projekt|projekttätigkeit|project/i.test(txt)) return h;
+		const txt = await formFrame.evaluate((el) => (el.textContent || el.getAttribute('aria-label') || '').trim(), h).catch(() => "");
+		if (!/projekt|projekttätigkeit|project/i.test(txt)) continue;
+
+		await formFrame.evaluate((el) => el.scrollIntoView({ behavior: "instant", block: "center" }), h);
+		await robustClick(formFrame, h);
+		const ok = await page.waitForSelector('#time_pze_selection_layer', { visible: true, timeout: 2000 }).then(() => true).catch(() => false);
+		if (ok) return;
 	}
-	const xp = [
-		'//a[contains(normalize-space(),"Projekt")]',
-		'//button[contains(normalize-space(),"Projekt")]',
-		'//a[contains(normalize-space(),"Projekttätigkeit")]',
-		'//button[contains(normalize-space(),"Projekttätigkeit")]',
-	];
-	for (const x of xp) {
-		const h = await waitForXPath(formFrame, x, { timeout: 1500 }).catch(() => null);
+
+	// 2) Textbasierte Suche im Formular
+	const textHandle = await formFrame.evaluateHandle(() => {
+		const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
+		while (walker.nextNode()) {
+			const el = walker.currentNode;
+			const txt = (el.textContent || '').trim();
+			if (txt && /projekt|projekttätigkeit/i.test(txt)) return el;
+		}
+		return null;
+	}).catch(() => null);
+	if (textHandle && textHandle.asElement()) {
+		const el = textHandle.asElement();
+		await formFrame.evaluate((e) => e.scrollIntoView({ behavior: "instant", block: "center" }), el);
+		await robustClick(formFrame, el);
+		const ok = await page.waitForSelector('#time_pze_selection_layer', { visible: true, timeout: 2000 }).then(() => true).catch(() => false);
+		if (ok) return;
+	}
+
+	// 3) Fokussierbares Feld mit Label „Projekt“ → Enter/Space via page.keyboard
+	const labelField = await findFieldByLabelText(formFrame, /projekt|projekttätigkeit/i);
+	if (labelField) {
+		await formFrame.evaluate((e) => e.scrollIntoView({ behavior: "instant", block: "center" }), labelField);
+		await labelField.focus().catch(() => { });
+		await page.keyboard.press('Enter').catch(() => { });
+		let ok = await page.waitForSelector('#time_pze_selection_layer', { visible: true, timeout: 1500 }).then(() => true).catch(() => false);
+		if (ok) return;
+
+		await page.keyboard.press('Space').catch(() => { });
+		ok = await page.waitForSelector('#time_pze_selection_layer', { visible: true, timeout: 1500 }).then(() => true).catch(() => false);
+		if (ok) return;
+	}
+
+	// 4) Doppelklick auf mögliche Trigger
+	for (const sel of candidateSelectors) {
+		const h = await formFrame.$(sel).catch(() => null);
+		if (!h) continue;
+		await formFrame.evaluate((el) => el.scrollIntoView({ behavior: "instant", block: "center" }), h);
+		await h.click({ clickCount: 2 }).catch(() => { });
+		const ok = await page.waitForSelector('#time_pze_selection_layer', { visible: true, timeout: 1500 }).then(() => true).catch(() => false);
+		if (ok) return;
+	}
+
+	throw new Error("Projektfeld im Formular nicht gefunden/öffnen fehlgeschlagen");
+}
+
+// findet ein Eingabefeld, das zu einer Label-/Text-Zelle mit Regex passt
+async function findFieldByLabelText(formFrame, regex) {
+	const handles = await formFrame.$$('label, .stdformlabel, th, td, span, a, button');
+	for (const h of handles) {
+		const txt = await formFrame.evaluate(el => (el.textContent || '').trim(), h).catch(() => "");
+		if (!txt || !regex.test(txt)) continue;
+		const neighbor = await formFrame.evaluateHandle((el) => {
+			const root = el.closest('tr, .row, .cf_row, .stdformrow') || el.parentElement;
+			if (!root) return null;
+			const inp = root.querySelector('input, a[role="button"], button, a');
+			return inp || null;
+		}, h).catch(() => null);
+		if (neighbor && neighbor.asElement()) return neighbor.asElement();
+	}
+	return null;
+}
+
+/* ===========================
+   Projekt-Dialog: Auswahl & Übernehmen (idempotent + state check)
+   =========================== */
+
+const MODE_ALIASES = {
+	Remote: ["Remote", "Homeoffice", "Home Office", "Home-Office", "Mobiles Arbeiten", "Mobile Arbeit"],
+	Office: ["Office", "Büro", "Office Stuttgart", "Office Nürnberg", "Vor Ort", "Onsite"],
+};
+
+function normalizeText(s) {
+	return (s || "").trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+async function getSelectedLeafText(page) {
+	// tries to read the title text of the selected node (or checked radio) if any
+	return await page.evaluate(() => {
+		const node = document.querySelector('#rexxtree .dynatree-node.dynatree-selected') ||
+			document.querySelector('#rexxtree .dynatree-radio input:checked')?.closest('.dynatree-node');
+		if (!node) return "";
+		const title = node.querySelector('.dynatree-title');
+		if (!title) return (node.textContent || "").trim();
+		return title.textContent.trim();
+	}).catch(() => "");
+}
+
+async function leafMatchesAnyLabel(page, leafHandle, labels) {
+	const text = await page.evaluate(el => {
+		const t = el.querySelector('.dynatree-title');
+		return (t ? t.textContent : el.textContent) || "";
+	}, leafHandle).catch(() => "");
+	const norm = normalizeText(text);
+	return labels.some(lbl => norm.includes(normalizeText(lbl)));
+}
+
+async function isLeafSelected(page, leafHandle) {
+	return await page.evaluate(el => {
+		const node = el.closest('.dynatree-node') || el;
+		if (node.classList.contains('dynatree-selected')) return true;
+		const radio = node.querySelector('.dynatree-radio input, input[type=radio]');
+		return !!(radio && radio.checked);
+	}, leafHandle).catch(() => false);
+}
+
+async function handleProjektAuswahlDialogOnPage(page, mode /*Office|Remote*/) {
+	const layer = await page
+		.waitForSelector("#time_pze_selection_layer", { visible: true, timeout: 15000 })
+		.catch(() => null);
+	if (!layer) throw new Error("Projekt-Auswahl-Dialog wurde nicht angezeigt");
+
+	const labels = MODE_ALIASES[mode] || [mode];
+
+	// (A) Prüfe, ob bereits eine passende Auswahl existiert → direkt übernehmen
+	const currentText = await getSelectedLeafText(page);
+	if (currentText) {
+		const match = labels.some(lbl => normalizeText(currentText).includes(normalizeText(lbl)));
+		if (match) {
+			// kleine Wartezeit, falls noch Animationsreste laufen
+			await delay(POST_SELECT_DELAY);
+			await clickApplyAndWaitClose(page);
+			return;
+		}
+	}
+
+	// (B) Andernfalls: suche passenden Folder/Leaf und wähle exakt einen passenden Leaf
+	let targetLeaf = await findAnyLeafMatchingMode(page, labels);
+	if (!targetLeaf) {
+		// Versuche über Folder → first leaf
+		let folder = null;
+		let folderXPath = null;
+		for (const label of labels) {
+			const xp =
+				'//div[@id="rexxtree"]' +
+				'//span[contains(@class,"dynatree-node") and contains(@class,"dynatree-folder")]' +
+				`[.//span[contains(@class,"dynatree-title")]/span[normalize-space()="${label}"] or .//span[contains(@class,"dynatree-title") and normalize-space()="${label}"]]`;
+			const f = await waitForXPath(page, xp, { visible: true, timeout: 2000 }).catch(() => null);
+			if (f) { folder = f; folderXPath = xp; break; }
+		}
+		if (folder) {
+			await expandFolderEnsureChildren(page, folder, folderXPath);
+			// nach expand: suche irgendeinen passenden Leaf unterhalb
+			targetLeaf = await findAnyLeafMatchingMode(page, labels);
+		}
+	}
+
+	if (!targetLeaf) throw new Error(`Kein Eintrag zu "${mode}" gefunden.`);
+
+	// (C) Wähle Leaf nur, wenn noch nicht ausgewählt
+	const alreadySelected = await isLeafSelected(page, targetLeaf);
+	if (!alreadySelected) {
+		await selectLeaf(page, targetLeaf); // Titel → Delay → Radio (falls nötig) → Wait selected
+	}
+
+	// (D) Finaler State-Check (muss zu Mode passen) vor Apply
+	const selectedText = await getSelectedLeafText(page);
+	const ok = labels.some(lbl => normalizeText(selectedText).includes(normalizeText(lbl)));
+	if (!ok) {
+		throw new Error(`Zielauswahl passt nicht: erwartet ${labels.join(" / ")}, gefunden: "${selectedText || "-"}"`);
+	}
+
+	await clickApplyAndWaitClose(page);
+}
+
+async function expandFolderEnsureChildren(page, folder, folderXPath) {
+	const expander = await folder.$(".dynatree-expander");
+	if (expander) { await expander.click().catch(() => { }); await delay(140); }
+
+	let childrenVisible = await waitForXPath(
+		page,
+		folderXPath + '/following-sibling::ul',
+		{ visible: true, timeout: 1500 }
+	).then(() => true).catch(() => false);
+	if (childrenVisible) return;
+
+	const title = await folder.$('.dynatree-title');
+	if (title) { await title.click().catch(() => { }); await delay(140); }
+
+	childrenVisible = await waitForXPath(
+		page,
+		folderXPath + '/following-sibling::ul',
+		{ visible: true, timeout: 1500 }
+	).then(() => true).catch(() => false);
+	if (childrenVisible) return;
+
+	if (expander) { await expander.click({ clickCount: 2 }).catch(() => { }); await delay(150); }
+	if (title) { await title.click({ clickCount: 2 }).catch(() => { }); await delay(150); }
+
+	await waitForXPath(page, folderXPath + '/following-sibling::ul', { visible: true, timeout: 800 }).catch(() => { });
+}
+
+async function findAnyLeafMatchingMode(page, labels) {
+	for (const label of labels) {
+		const xp =
+			'//div[@id="rexxtree"]' +
+			`//span[contains(@class,"dynatree-title") and (contains(normalize-space(),"${label}") or normalize-space()="${label}")]` +
+			'/ancestor::span[contains(@class,"dynatree-node") and not(contains(@class,"dynatree-folder"))][1]';
+		const h = await waitForXPath(page, xp, { visible: true, timeout: 800 }).catch(() => null);
 		if (h) return h;
 	}
 	return null;
 }
 
-async function handleProjektAuswahlDialogOnPage(page, mode /*Office|Remote*/) {
-	const layer = await page
-		.waitForSelector("#time_pze_selection_layer", {
-			visible: true,
-			timeout: 15000,
-		})
-		.catch(() => null);
-	if (!layer) throw new Error("Projekt-Auswahl-Dialog wurde nicht angezeigt");
-
-	const label = mode.trim();
-
-	const folderXPath =
-		'//div[@id="rexxtree"]' +
-		'//span[contains(@class,"dynatree-node") and contains(@class,"dynatree-folder")]' +
-		`[.//span[contains(@class,"dynatree-title")]/span[normalize-space()="${label}"] or .//span[contains(@class,"dynatree-title") and normalize-space()="${label}"]]`;
-	const folder = await waitForXPath(page, folderXPath, {
-		visible: true,
-		timeout: 10000,
-	}).catch(() => null);
-	if (!folder) throw new Error(`Projekt-Knoten "${label}" nicht gefunden.`);
-
-	const expander = await folder.$(".dynatree-expander");
-	if (expander) {
-		await expander.click().catch(() => { });
-		await delay(120);
+/**
+ * Auswahl mit Zustandsprüfung:
+ * - Titel-Klick → Delay (Animation)
+ * - Wenn Radio vorhanden und nicht checked → Radio-Klick
+ * - Warten bis selected/checked → kleiner Post-Delay
+ * - Nie doppelt klicken, wenn bereits selected
+ */
+async function selectLeaf(page, leafHandle) {
+	// ist Leaf bereits gewählt?
+	if (await isLeafSelected(page, leafHandle)) {
+		await delay(POST_SELECT_DELAY);
+		return;
 	}
 
-	const firstLeafXPath =
-		folderXPath +
-		'/following-sibling::ul//span[contains(@class,"dynatree-node") and not(contains(@class,"dynatree-folder"))][1]';
-	const firstLeaf = await waitForXPath(page, firstLeafXPath, {
-		visible: true,
-		timeout: 10000,
-	}).catch(() => null);
-	if (!firstLeaf) throw new Error(`Kein Eintrag unter "${label}" gefunden.`);
-	const radio = await firstLeaf.$(".dynatree-radio");
-	if (radio) await radio.click();
-	else await firstLeaf.click();
-	await delay(120);
-
-	const applyBtn = await page.$('#aside_navbar_collapse a[aria-label="Übernehmen"]');
-	if (applyBtn) {
-		await applyBtn.click();
+	const title = await leafHandle.$('.dynatree-title');
+	if (title) {
+		await title.click().catch(() => { });
+		await delay(NODE_ANIM_DELAY);
 	} else {
-		const any = await $x(page, "//a[contains(normalize-space(),'Übernehmen')]");
-		if (any[0]) await any[0].click();
+		await leafHandle.click().catch(() => { });
+		await delay(NODE_ANIM_DELAY);
 	}
-	await page
-		.waitForSelector("#time_pze_selection_layer", {
-			hidden: true,
-			timeout: 15000,
-		})
-		.catch(() => { });
+
+	// radio ggf. klicken (nur wenn nicht bereits checked)
+	const radio = await leafHandle.$(".dynatree-radio input, input[type=radio]");
+	if (radio) {
+		const already = await page.evaluate(inp => !!inp.checked, radio).catch(() => false);
+		if (!already) await radio.click().catch(() => { });
+	}
+
+	// Warten, bis ausgewählt (Klasse oder Radio-Checked)
+	await page.waitForFunction((el) => {
+		const node = el.closest('.dynatree-node') || el;
+		if (node.classList.contains('dynatree-selected')) return true;
+		const r = node.querySelector('.dynatree-radio input, input[type=radio]');
+		return !!(r && r.checked);
+	}, { timeout: 3000 }, leafHandle).catch(() => { });
+
+	await delay(POST_SELECT_DELAY);
 }
+
+/**
+ * Klickt „Übernehmen“ und wartet, bis der Layer verschwunden ist.
+ * Falls Warnung erscheint („Bitte wählen Sie eine Projektkategorie aus.“),
+ * klickt automatisch „OK“, wartet kurz und versucht die Übernahme erneut (2 Versuche).
+ * Vor dem Klicken prüft sie, dass überhaupt eine Auswahl vorhanden ist.
+ */
+async function clickApplyAndWaitClose(page) {
+	// Hard check: eine Auswahl muss vorhanden sein
+	const hasSelection = await page.evaluate(() => {
+		const selNode = document.querySelector('#rexxtree .dynatree-node.dynatree-selected');
+		const selRadio = document.querySelector('#rexxtree .dynatree-radio input:checked');
+		return !!(selNode || selRadio);
+	}).catch(() => false);
+
+	if (!hasSelection) throw new Error("Übernehmen ohne Auswahl verhindert (keine Projektkategorie gewählt)");
+
+	for (let attempt = 0; attempt < 2; attempt++) {
+		await delay(150);
+
+		const applyBtn = await page.$('#aside_navbar_collapse a[aria-label="Übernehmen"]');
+		if (applyBtn) {
+			await applyBtn.click().catch(() => { });
+		} else {
+			const any = await $x(page, "//a[contains(normalize-space(),'Übernehmen')]");
+			if (any[0]) await any[0].click().catch(() => { });
+		}
+
+		const closed = await page
+			.waitForSelector("#time_pze_selection_layer", { hidden: true, timeout: 1000 })
+			.then(() => true)
+			.catch(() => false);
+
+		if (closed) return;
+
+		// Prüfe Alert
+		const alertBox = await page.$('#confirmBoxOuter');
+		const alertVisible = alertBox
+			? await page.evaluate(el => {
+				const s = window.getComputedStyle(el);
+				return s && s.display !== 'none' && s.visibility !== 'hidden';
+			}, alertBox).catch(() => false)
+			: false;
+
+		if (alertVisible) {
+			const okBtn =
+				(await page.$('#confirmButtons .btn.primary[name="ok"]')) ||
+				(await page.$('#confirmButtons .btn.primary'));
+			if (okBtn) await okBtn.click().catch(() => { });
+			await page.waitForSelector('#confirmBoxOuter', { hidden: true, timeout: 2000 }).catch(() => { });
+			await delay(250);
+			continue; // nochmal versuchen
+		}
+
+		const closedLate = await page
+			.waitForSelector("#time_pze_selection_layer", { hidden: true, timeout: 3000 })
+			.then(() => true)
+			.catch(() => false);
+		if (closedLate) return;
+	}
+
+	await page
+		.waitForSelector("#time_pze_selection_layer", { hidden: true, timeout: 6000 })
+		.catch(() => { throw new Error("Projekt-Dialog schloss nicht rechtzeitig (nach Alert-Handling)"); });
+}
+
+/* ===========================
+   Speichern & Abschluss
+   =========================== */
 
 async function saveAndCloseForm(formFrame, untenFrame) {
 	let btn = await formFrame.$("a#application_creation_toolbar_save");
@@ -582,26 +881,16 @@ async function saveAndCloseForm(formFrame, untenFrame) {
 
 	// Warten, bis der Formular-iFrame wieder verschwindet
 	await untenFrame
-		.waitForSelector("iframe#time_workflow_form_layer_iframe", {
-			hidden: true,
-			timeout: 30000,
-		})
+		.waitForSelector("iframe#time_workflow_form_layer_iframe", { hidden: true, timeout: 30000 })
 		.catch(async () => {
-			await formFrame
-				.waitForSelector("a#application_creation_toolbar_save", {
-					hidden: true,
-					timeout: 10000,
-				})
-				.catch(() => { });
+			await formFrame.waitForSelector("a#application_creation_toolbar_save", { hidden: true, timeout: 10000 }).catch(() => { });
 		});
 
 	// Widget-Container wieder sichtbar (Refresh)
 	await retry(
-		() =>
-			waitForSelectorWithRetry(untenFrame, "div#my_timemanagement_widget", {
-				visible: true,
-			}),
+		() => waitForSelectorWithRetry(untenFrame, "div#my_timemanagement_widget", { visible: true }),
 		2,
-		800
+		800,
+		"widgetRefresh"
 	).catch(() => { });
 }
