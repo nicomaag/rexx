@@ -1,7 +1,7 @@
 #!/bin/bash
 # Run this script to pull and run the container, saving logs with a timestamped filename
 
-IMAGE="nicomaa/rexx:latest"
+IMAGE="registry.sutido.com/nicomaa/rexx:latest"
 LOG_DIR="/data/rexx/logs" # Change this to your desired log directory
 ENV_FILE_DIR="/data/rexx/.env" # Change this to your desired env file directory
 mkdir -p "$LOG_DIR"
