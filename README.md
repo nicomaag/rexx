@@ -67,6 +67,10 @@ Define which weekdays are **Remote** vs **Office**. English and German short tok
 ```env
 # Additional wait to accommodate UI animations (ms)
 NODE_ANIM_DELAY_MS=180
+
+# Webhook that gets a message when a booking fails or the run aborts
+# (Slack incoming-webhook format: POST {"text": "..."}). Unset = no notification.
+NOTIFY_WEBHOOK_URL=https://hooks.slack.com/services/...
 ```
 
 ---
@@ -78,6 +82,7 @@ NODE_ANIM_DELAY_MS=180
 - `--mode=Remote|Office` (fallback if ENV has no weekday rule)
 - `--debug` (run headful and slow down steps)
 - `--slowmo=250` (ms per action when `--debug` is used)
+- `--vormonat` (also check the previous month; happens automatically on the 1st–3rd of a month, because the widget opens on the current month and the 30th/31st would otherwise never be booked)
 
 **Examples:**
 
@@ -137,6 +142,8 @@ crontab -e
 ## Logging
 
 Each run creates a log file like `rexx-YYYY-MM-DD_HH-MM-SS.log` in your log directory.
+
+The process exits with code 1 when at least one booking failed or the run aborted. If `NOTIFY_WEBHOOK_URL` is set, the failed days (or the abort reason) are posted there. When the project dialog shows no matching entry, the log lists what the dialog offered, so a changed rexx layout is visible without a debug session.
 
 ---
 
